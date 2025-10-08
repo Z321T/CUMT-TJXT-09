@@ -28,3 +28,74 @@ ItemCF 相比基线偏置模型在评分预测上取得明确提升，推荐质�
 
 **结论**  
 ItemCF 版本在评分预测优于当前 UserCF 新版，实现了更高覆盖率，保持了尚可的新颖性；但 Precision / Recall 偏低，需在“相似度裁剪 / shrinkage / 热门惩罚强度 / 候选截断”之间再做平衡。整体结构正确，可作为后续融合（如 UserCF + ItemCF 或 加入 MF）的稳健基线。
+
+
+
+
+
+
+
+
+
+### 1. 数据加载与索引重映射  
+- 读取 `u.data` 与 `u.item`；构建评分 DataFrame 与电影标题表。  
+- 为出现的用户 / 物品建立连续整数映射 `user_id → u_idx`，`movie_id → m_idx`，便于矩阵化与 GPU 张量计算。  
+
+### 2. 训练/测试划分与评分矩阵构建  
+- 随机划分训练/测试（默认 8:2）。  
+- 初始化 `train_mat (U×I, float32)`，未评分置 0；逐行写入训练集中已评分条目。  
+- 采用稠密矩阵 + 掩码，牺牲少量内存换取一次性 GPU 批量运算简洁。  
+
+### 3. 基线统计与偏置  
+- 计算总体均值 `μ`。  
+- 若启用偏置：迭代正则估计用户偏置 `b_u`、物品偏置 `b_i`（收缩防过拟合）。  
+- 否则仅保留每用户平均评分作简单中心化备选。  
+
+### 4. 残差矩阵构造  
+- 掩码 `mask = (R > 0)`。  
+- 基线预测 `base = μ + b_u + b_i`（或用户均值）。  
+- 残差 `residual = (R - base) * mask`，未评分位置保持 0。  
+
+### 5. 可选用户频率惩罚 (IUF 反向思路的用户频率因子)  
+- 若启用 `use_uf`：根据每个用户的评分数量计算衰减系数（活跃用户权重缩小），`residual *= uf`。  
+
+### 6. 物品相似度计算  
+- 对残差矩阵列向量做归一：`sim = (C^T C) / (||c_i|| · ||c_j||)`。  
+- 共同评分数矩阵 `common = mask^T mask`。  
+- 过滤：`common < min_common` 置 0。  
+- Shrinkage：`sim *= common / (common + shrinkage)` 提升小样本稳健性。  
+- 最小相似度阈值 `min_sim`；可选丢弃负相似度 (`keep_neg_sims=False`)。  
+- 对角线清零；可选幂放大 `sim = sign(sim)*|sim|^{sim_alpha}`。  
+
+### 7. 相似度稀疏化（Top\-K / 自适应）  
+- 固定 `k_neighbors` 或按 `adaptive_k_percent` 为每行保留最相关若干物品，其余置 0。  
+- 得到稀疏（仍存稠密张量表示）相似度矩阵 `S`。  
+
+### 8. 全量评分预测  
+- 再次构造基线 `base` 与残差。  
+- 归一化加权汇总：  
+  - `numer = residual @ S^T`  
+  - `denom = mask @ |S|^T`（对每个用户-物品聚合邻居权重绝对值）  
+  - `contrib = numer / denom`（邻居不足 `fallback_min_neighbors` 则回退 0）  
+  - `pred = clamp(base + contrib, 1, 5)`  
+- 训练集中已知评分位置用真实值覆盖，形成最终预测矩阵。  
+
+### 9. 评估  
+- 评分指标：在测试集中计算 RMSE、MAE。  
+- Top\-N：对每用户屏蔽训练已看的物品，从预测矩阵取最高 N：  
+  - Precision@N / Recall@N  
+  - Coverage（被推荐不同物品占全集比例）  
+  - Popularity（推荐物品平均流行度）  
+
+### 10. 主要超参作用  
+- `k_neighbors`：相似度保留规模（精度 vs 覆盖）。  
+- `min_common`：最小共同评分，提升置信度。  
+- `shrinkage`：收缩高噪声相似度。  
+- `min_sim`、`keep_neg_sims`、`sim_alpha`：相似度阈值、符号策略与放大。  
+- `enable_bias` / `bias_reg`：偏置稳定化。  
+- `use_uf`：抑制高活跃用户主导。  
+- `fallback_min_neighbors`：避免少数邻居造成噪声放大。  
+- `topn`：推荐列表长度。  
+
+### 11. 流程汇总  
+数据加载 → 矩阵与映射 → 基线/偏置 → 残差与可选用户频率调制 → 物品相似度（过滤+收缩+稀疏化） → 矩阵化批量预测 → 评分与推荐评估。
